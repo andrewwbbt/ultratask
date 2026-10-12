@@ -1,0 +1,18 @@
+# Токен и личные настройки остаются только на компьютере или в Railway Variables.
+.env
+.env.*
+!.env.example
+
+# Локальное окружение и временные файлы Python.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+
+# Личные данные бота: основная SQLite-база, копии и журналы SQLite.
+*.db
+*.db.*
+*.db-*
+*.sqlite
+*.sqlite3
