@@ -30,17 +30,21 @@ class WeatherTests(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.temp_dir.name) / "tasks.db"
         bot.init_database(self.path)
         bot.save_location(self.path, 11, {
-            "name": "Москва", "country": "Россия", "latitude": 55.75, "longitude": 37.62,
+            "name": "Москва", "admin1": "Московская область", "country": "Россия",
+            "latitude": 55.75, "longitude": 37.62,
         })
 
     async def test_forecast_and_city_are_saved(self):
         location = bot.get_location(self.path, 11)
-        self.assertEqual((location["city_name"], location["latitude"]), ("Москва", 55.75))
+        self.assertEqual((location["city_name"], location["admin1"], location["latitude"]),
+                         ("Москва", "Московская область", 55.75))
         with patch.object(bot, "fetch_json", new=AsyncMock(return_value=FORECAST)) as fetch:
             result = await bot.weather_text(location)
         self.assertIn("+12.5 °C, пасмурно", result)
         self.assertIn("осадки 0.2 мм", result)
         self.assertIn("вероятность осадков до 60%", result)
+        self.assertIn("Москва, Московская область, Россия", result)
+        self.assertTrue(result.startswith("☁️ Погода:"))
         self.assertEqual(fetch.call_args.args[0], bot.FORECAST_URL)
         self.assertEqual(fetch.call_args.args[1]["timezone"], "auto")
 
@@ -57,7 +61,7 @@ class WeatherTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "fetch_json", new=AsyncMock(return_value=FORECAST)):
             await bot.show_tasks(update, context, today=True)
         self.assertEqual(message.reply_text.await_count, 2)
-        self.assertIn("🌤 Москва", message.reply_text.await_args_list[0].args[0])
+        self.assertIn("☁️ Москва", message.reply_text.await_args_list[0].args[0])
         self.assertEqual(message.reply_text.await_args_list[1].args[0], "На сегодня задач нет.")
 
     async def test_bad_weather_response_has_friendly_error(self):
@@ -85,7 +89,22 @@ class WeatherTests(unittest.IsolatedAsyncioTestCase):
         update.callback_query = query
         await bot.callbacks(update, context)
         self.assertEqual(bot.get_location(self.path, 11)["longitude"], -95.56)
+        self.assertEqual(bot.get_location(self.path, 11)["admin1"], "Техас")
         self.assertEqual(context.user_data, {})
+
+    async def test_duplicate_city_labels_are_not_offered_twice(self):
+        response = {"results": [
+            {"name": "Хабаровск", "admin1": "Хабаровский край", "country": "Россия",
+             "latitude": 48.5, "longitude": 135.1},
+            {"name": "Хабаровск", "admin1": "Хабаровский край", "country": "Россия",
+             "latitude": 48.6, "longitude": 135.2},
+            {"name": "Хабаровск", "admin1": "Иркутская область", "country": "Россия",
+             "latitude": 53.0, "longitude": 104.0},
+        ]}
+        with patch.object(bot, "fetch_json", new=AsyncMock(return_value=response)):
+            cities = await bot.search_cities("Хабаровск")
+        self.assertEqual(len(cities), 2)
+        self.assertEqual(cities[0]["admin1"], "Хабаровский край")
 
 
 if __name__ == "__main__":

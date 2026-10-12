@@ -39,6 +39,7 @@ load_dotenv(BASE_DIR / ".env")
 LOGGER = logging.getLogger(__name__)
 
 PRIORITIES = {"low": "Низкий", "normal": "Обычный", "high": "Высокий"}
+PRIORITY_ICONS = {"low": "🟢", "normal": "🔵", "high": "🔴"}
 REMINDERS = {0: "Без напоминания", 10: "За 10 минут", 60: "За 1 час", 1440: "За 1 день"}
 DATETIME_FORMAT = "%d.%m.%Y %H:%M"
 PAGE_SIZE = 10
@@ -172,11 +173,16 @@ def init_database(path: Path) -> None:
             """CREATE TABLE IF NOT EXISTS user_locations (
                 user_id INTEGER PRIMARY KEY,
                 city_name TEXT NOT NULL,
+                admin1 TEXT NOT NULL DEFAULT '',
                 country TEXT,
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL
             )"""
         )
+        # Старые базы содержат координаты, но ещё не содержат регион города.
+        location_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_locations)")}
+        if "admin1" not in location_columns:
+            db.execute("ALTER TABLE user_locations ADD COLUMN admin1 TEXT NOT NULL DEFAULT ''")
         db.execute(
             """CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -328,12 +334,13 @@ def save_location(path: Path, user_id: int, location: dict) -> None:
     with database(path) as db:
         db.execute(
             """INSERT INTO user_locations
-               (user_id, city_name, country, latitude, longitude)
-               VALUES (?, ?, ?, ?, ?)
+               (user_id, city_name, admin1, country, latitude, longitude)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
-               city_name = excluded.city_name, country = excluded.country,
+               city_name = excluded.city_name, admin1 = excluded.admin1,
+               country = excluded.country,
                latitude = excluded.latitude, longitude = excluded.longitude""",
-            (user_id, location["name"], location["country"],
+            (user_id, location["name"], location.get("admin1") or "", location["country"],
              location["latitude"], location["longitude"]),
         )
 
@@ -355,12 +362,13 @@ async def fetch_json(url: str, params: dict) -> dict:
 async def search_cities(name: str) -> list[dict]:
     data = await fetch_json(
         GEOCODING_URL,
-        {"name": name, "count": 5, "language": "ru", "format": "json"},
+        {"name": name, "count": 10, "language": "ru", "format": "json"},
     )
     results = data.get("results", [])
     if not isinstance(results, list):
         raise WeatherError("Не удалось прочитать список городов. Попробуйте позже.")
     cities = []
+    seen = set()
     for item in results:
         if not isinstance(item, dict):
             continue
@@ -372,20 +380,30 @@ async def search_cities(name: str) -> list[dict]:
             continue
         if not city_name or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
             continue
+        admin1 = str(item.get("admin1") or "").strip()
+        country = str(item.get("country") or "").strip()
+        # API может вернуть несколько точек с одинаковой подписью: оставляем одну.
+        label_key = (city_name.casefold(), admin1.casefold(), country.casefold())
+        if label_key in seen:
+            continue
+        seen.add(label_key)
         cities.append({
             "name": city_name,
-            "admin1": str(item.get("admin1") or "").strip(),
-            "country": str(item.get("country") or "").strip(),
+            "admin1": admin1,
+            "country": country,
             "latitude": latitude,
             "longitude": longitude,
         })
-    return cities
+    # Точное совпадение с запросом показываем первым; порядок API внутри групп сохраняем.
+    cities.sort(key=lambda city: city["name"].casefold() != name.strip().casefold())
+    return cities[:5]
 
 
 def location_label(location: dict | sqlite3.Row) -> str:
     parts = [location["name"] if isinstance(location, dict) else location["city_name"]]
-    if isinstance(location, dict) and location["admin1"] not in {"", parts[0]}:
-        parts.append(location["admin1"])
+    admin1 = location.get("admin1", "") if isinstance(location, dict) else location["admin1"]
+    if admin1 not in {"", parts[0]}:
+        parts.append(admin1)
     if location["country"]:
         parts.append(location["country"])
     return ", ".join(parts)
@@ -410,7 +428,12 @@ async def select_city(update: Update, context: ContextTypes.DEFAULT_TYPE, name: 
     if len(cities) == 1:
         save_location(db_path(context), update.effective_user.id, cities[0])
         context.user_data.clear()
-        await update.effective_message.reply_text(f"✅ Город выбран: {location_label(cities[0])}.")
+        await update.effective_message.reply_text(
+            f"✅ Город выбран: {location_label(cities[0])}.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🌤 Показать погоду", callback_data="weather")
+            ]]),
+        )
         return
     context.user_data["flow"] = "city_pick"
     context.user_data["city_candidates"] = cities
@@ -431,12 +454,17 @@ async def select_city(update: Update, context: ContextTypes.DEFAULT_TYPE, name: 
 async def city_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update):
         return
-    context.user_data.clear()
     if context.args:
+        context.user_data.clear()
         await select_city(update, context, " ".join(context.args))
     else:
-        context.user_data["flow"] = "city_name"
-        await update.effective_message.reply_text("Напишите название города. Например: Москва.")
+        await begin_city(update, context)
+
+
+async def begin_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["flow"] = "city_name"
+    await update.effective_message.reply_text("🏙 Напишите название города. Например: Москва.")
 
 
 def first_daily(daily: dict, key: str) -> float | int | None:
@@ -446,6 +474,23 @@ def first_daily(daily: dict, key: str) -> float | int | None:
 
 def temp_text(value: float | int) -> str:
     return f"{value:+g} °C"
+
+
+def weather_icon(code: int) -> str:
+    """Подбирает значок по коду Open-Meteo, а не показывает одно солнце при любой погоде."""
+    if code == 0:
+        return "☀️"
+    if code in {1, 2, 3}:
+        return "🌤" if code != 3 else "☁️"
+    if code in {45, 48}:
+        return "🌫"
+    if code in {71, 73, 75, 77, 85, 86}:
+        return "❄️"
+    if code in {95, 96, 97, 99}:
+        return "⛈"
+    if code in WEATHER_CODES:
+        return "🌧"
+    return "🌡"
 
 
 async def weather_text(location: sqlite3.Row, *, brief: bool = False) -> str:
@@ -475,14 +520,14 @@ async def weather_text(location: sqlite3.Row, *, brief: bool = False) -> str:
     city = location["city_name"]
     if brief:
         return (
-            f"🌤 {city}: сейчас {temp_text(current_temp)}, {current_condition}. "
+            f"{weather_icon(current_code)} {city}: сейчас {temp_text(current_temp)}, {current_condition}. "
             f"Сегодня {temp_text(low)}…{temp_text(high)}, {day_condition}; "
             f"вероятность осадков до {chance}."
         )
     return (
-        f"🌤 Погода: {location_label(location)}\n"
-        f"Сейчас: {temp_text(current_temp)}, {current_condition}; осадки {precipitation:g} мм.\n"
-        f"Сегодня: {temp_text(low)}…{temp_text(high)}, {day_condition}; "
+        f"{weather_icon(current_code)} Погода: {location_label(location)}\n"
+        f"🌡 Сейчас: {temp_text(current_temp)}, {current_condition}; осадки {precipitation:g} мм.\n"
+        f"📅 Сегодня: {temp_text(low)}…{temp_text(high)}, {day_condition}; "
         f"вероятность осадков до {chance}."
     )
 
@@ -497,7 +542,11 @@ async def send_weather(update: Update, context: ContextTypes.DEFAULT_TYPE, *, br
         except WeatherError as exc:
             LOGGER.warning("Не удалось получить погоду для пользователя %s: %s", update.effective_user.id, exc)
             message = "Погода сейчас недоступна." if brief else str(exc)
-    await update.effective_message.reply_text(message)
+    city_button = "🏙 Выбрать город" if location is None else "🏙 Сменить город"
+    markup = None if brief else InlineKeyboardMarkup([[
+        InlineKeyboardButton(city_button, callback_data="change_city")
+    ]])
+    await update.effective_message.reply_text(message, reply_markup=markup)
 
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,7 +578,7 @@ def parse_due(value: str, tz: ZoneInfo) -> datetime | None:
 
 def priority_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label, callback_data=f"{prefix}:{code}")]
+        [[InlineKeyboardButton(f"{PRIORITY_ICONS[code]} {label}", callback_data=f"{prefix}:{code}")]
          for code, label in PRIORITIES.items()]
     )
 
@@ -541,12 +590,42 @@ def reminder_keyboard(prefix: str) -> InlineKeyboardMarkup:
     )
 
 
+def due_choice_keyboard(mode: str, tz: ZoneInfo) -> InlineKeyboardMarkup:
+    """Быстрый выбор дня; «сегодня» скрывается, если день почти закончился."""
+    now = now_utc().astimezone(tz)
+    rows = []
+    if (now + timedelta(minutes=1)).date() == now.date():
+        rows.append([InlineKeyboardButton("📅 Сегодня", callback_data=f"dueday:{mode}:today")])
+    rows.append([InlineKeyboardButton("📆 Завтра", callback_data=f"dueday:{mode}:tomorrow")])
+    rows.append([
+        InlineKeyboardButton("Без срока", callback_data=f"dueday:{mode}:none"),
+        InlineKeyboardButton("✍️ Ввести дату", callback_data=f"dueday:{mode}:manual"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def due_time_keyboard(mode: str, day: date, tz: ZoneInfo) -> InlineKeyboardMarkup:
+    """Предлагаем только те стандартные часы, которые ещё не прошли."""
+    rows = []
+    for clock in ("09:00", "12:00", "18:00"):
+        try:
+            parse_due(f"{day:%d.%m.%Y} {clock}", tz)
+        except ValueError:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"🕒 {clock}", callback_data=f"duetime:{mode}:{clock.replace(':', '')}",
+        )])
+    rows.append([InlineKeyboardButton("✍️ Другое время", callback_data=f"duetime:{mode}:manual")])
+    return InlineKeyboardMarkup(rows)
+
+
 def task_text(task: sqlite3.Row, tz: ZoneInfo) -> str:
     mark = "✅" if task["status"] == "done" else "▫️"
     return (
         f"{mark} #{task['task_number']} {task['title']}\n"
-        f"Приоритет: {PRIORITIES[task['priority']]} · Срок: {format_due(task['due_at'], tz)}\n"
-        f"Напоминание: {REMINDERS.get(task['reminder_minutes'], 'выключено')}"
+        f"{PRIORITY_ICONS[task['priority']]} Приоритет: {PRIORITIES[task['priority']]} "
+        f"· 📅 Срок: {format_due(task['due_at'], tz)}\n"
+        f"🔔 Напоминание: {REMINDERS.get(task['reminder_minutes'], 'выключено')}"
     )
 
 
@@ -586,6 +665,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             [InlineKeyboardButton("➕ Добавить", callback_data="new")],
             [InlineKeyboardButton("📋 Задачи", callback_data="list"),
              InlineKeyboardButton("📅 Сегодня", callback_data="today")],
+            [InlineKeyboardButton("✅ Выполнить", callback_data="done_picker"),
+             InlineKeyboardButton("🌤 Погода", callback_data="weather")],
         ]),
     )
 
@@ -598,9 +679,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/tasks — открытые задачи\n/today — на сегодня, включая новые без срока\n"
         "/week — созданные за 7 дней\n/search — поиск задач\n/history — история действий\n"
         "/city — выбрать город\n/weather — погода и прогноз\n"
-        "/done ID — выполнить\n/edit ID — изменить\n/delete ID — удалить\n"
+        "/done — выбрать задачу кнопкой; /done ID — выполнить по номеру\n"
+        "/edit ID — изменить\n/delete ID — удалить\n"
         "/stats — статистика\n/cancel — отменить ввод\n\n"
-        "Срок вводите как ДД.ММ.ГГГГ ЧЧ:ММ или «нет». "
+        "Срок можно выбрать кнопками или ввести как ДД.ММ.ГГГГ ЧЧ:ММ. "
         "Напоминание придёт в личный чат."
     )
 
@@ -617,29 +699,57 @@ async def begin_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.clear()
     context.user_data["flow"] = "add_title"
-    await update.effective_message.reply_text("Название задачи? (до 200 символов)")
+    await update.effective_message.reply_text("📝 Название задачи? (до 200 символов)")
 
 
 async def ask_due(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["flow"] = "add_due"
+    context.user_data["flow"] = "add_due_choice"
     await update.effective_message.reply_text(
-        f"Срок в часовом поясе {local_tz(context).key}: ДД.ММ.ГГГГ ЧЧ:ММ.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Без срока", callback_data="due:none")]]),
+        f"📅 Когда выполнить? Часовой пояс: {local_tz(context).key}. "
+        "Выберите день или введите ДД.ММ.ГГГГ ЧЧ:ММ.",
+        reply_markup=due_choice_keyboard("add", local_tz(context)),
     )
+
+
+async def apply_due(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    mode: str, due: datetime | None) -> None:
+    """Завершает выбор срока одинаково для новой и существующей задачи."""
+    context.user_data.pop("due_day", None)
+    if mode == "add":
+        context.user_data["due_at"] = to_db(due)
+        await ask_reminder(update, context)
+    else:
+        await update_field(update, context, "due_at", to_db(due))
+
+
+async def accept_due_time(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          mode: str, raw_time: str) -> None:
+    """Соединяет выбранный день со временем и повторно проверяет будущий срок."""
+    try:
+        day = date.fromisoformat(context.user_data["due_day"])
+        clock = datetime.strptime(raw_time, "%H:%M").strftime("%H:%M")
+        due = parse_due(f"{day:%d.%m.%Y} {clock}", local_tz(context))
+    except (KeyError, ValueError):
+        await update.effective_message.reply_text(
+            "Время неверное или уже прошло. Введите будущее время как ЧЧ:ММ "
+            "или начните выбор срока заново."
+        )
+        return
+    await apply_due(update, context, mode, due)
 
 
 async def ask_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["flow"] = "add_reminder"
     if context.user_data.get("due_at") is None:
         await update.effective_message.reply_text(
-            "Без срока напоминание недоступно.",
+            "🔔 Без срока напоминание недоступно.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Сохранить задачу", callback_data="reminder:0")
             ]]),
         )
         return
     await update.effective_message.reply_text(
-        "Когда напомнить?", reply_markup=reminder_keyboard("reminder")
+        "🔔 Когда напомнить?", reply_markup=reminder_keyboard("reminder")
     )
 
 
@@ -699,6 +809,44 @@ async def show_tasks(
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await show_tasks(update, context)
+
+
+async def show_done_picker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, offset: int = 0
+) -> None:
+    """Даёт выбрать задачу по названию; кнопка несёт постоянный внутренний ID."""
+    if not await private_only(update):
+        return
+    with database(db_path(context)) as db:
+        rows = db.execute(
+            "SELECT id, task_number, title FROM tasks "
+            "WHERE user_id = ? AND status = 'active' ORDER BY task_number",
+            (update.effective_user.id,),
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("Открытых задач нет.")
+        return
+    offset = min(max(offset, 0), ((len(rows) - 1) // PAGE_SIZE) * PAGE_SIZE)
+    page = rows[offset:offset + PAGE_SIZE]
+    buttons = [[InlineKeyboardButton(
+        f"✅ №{row['task_number']} · {row['title'][:43]}",
+        callback_data=f"done:{row['id']}",
+    )] for row in page]
+    navigation = []
+    if offset > 0:
+        navigation.append(InlineKeyboardButton(
+            "⬅️ Назад", callback_data=f"donepage:{offset - PAGE_SIZE}",
+        ))
+    if offset + PAGE_SIZE < len(rows):
+        navigation.append(InlineKeyboardButton(
+            "Дальше ➡️", callback_data=f"donepage:{offset + PAGE_SIZE}",
+        ))
+    if navigation:
+        buttons.append(navigation)
+    await update.effective_message.reply_text(
+        f"✅ Какую задачу выполнить? ({offset + 1}–{offset + len(page)} из {len(rows)})",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -942,7 +1090,11 @@ async def command_with_id(update: Update, context: ContextTypes.DEFAULT_TYPE, ac
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await command_with_id(update, context, "done")
+    if not context.args:
+        context.user_data.clear()
+        await show_done_picker(update, context)
+    else:
+        await command_with_id(update, context, "done")
 
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -980,7 +1132,9 @@ async def dispatch_action(
                 task["title"], "completed",
             )
             renumber_active_tasks(db, update.effective_user.id)
-        await update.effective_message.reply_text(f"✅ Задача #{number} выполнена.")
+        await update.effective_message.reply_text(
+            f"✅ Задача #{number} «{task['title']}» выполнена."
+        )
     elif action == "edit":
         if task["status"] == "done":
             await update.effective_message.reply_text("Выполненную задачу нельзя изменить.")
@@ -1039,21 +1193,24 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if flow == "add_title":
             context.user_data["title"] = value
             context.user_data["flow"] = "add_priority"
-            await update.effective_message.reply_text("Приоритет?", reply_markup=priority_keyboard("priority"))
+            await update.effective_message.reply_text(
+                "🎯 Приоритет задачи?", reply_markup=priority_keyboard("priority")
+            )
         else:
             await update_field(update, context, "title", value)
         return
-    if flow in {"add_due", "edit_due"}:
+    if flow in {"add_due_time", "edit_due_time"}:
+        await accept_due_time(update, context, flow.split("_", 1)[0], value)
+        return
+    if flow in {"add_due_choice", "add_due_manual", "edit_due_choice", "edit_due_manual",
+                "add_due", "edit_due"}:
         try:
             due = parse_due(value, local_tz(context))
         except ValueError:
             await update.effective_message.reply_text("Неверный срок. Введите будущую дату как ДД.ММ.ГГГГ ЧЧ:ММ или «нет».")
             return
-        if flow == "add_due":
-            context.user_data["due_at"] = to_db(due)
-            await ask_reminder(update, context)
-        else:
-            await update_field(update, context, "due_at", to_db(due))
+        await apply_due(update, context, flow.split("_", 1)[0], due)
+        return
 
 
 async def update_field(
@@ -1122,6 +1279,23 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data in {"list", "today"}:
         await show_tasks(update, context, today=data == "today")
         return
+    if data == "done_picker":
+        context.user_data.clear()
+        await show_done_picker(update, context)
+        return
+    if data.startswith("donepage:"):
+        try:
+            offset = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        await show_done_picker(update, context, offset=offset)
+        return
+    if data == "weather":
+        await send_weather(update, context)
+        return
+    if data == "change_city":
+        await begin_city(update, context)
+        return
     if data.startswith("citypick:"):
         candidates = context.user_data.get("city_candidates")
         token = None
@@ -1137,7 +1311,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         save_location(db_path(context), update.effective_user.id, city)
         context.user_data.clear()
-        await query.message.reply_text(f"✅ Город выбран: {location_label(city)}.")
+        await query.message.reply_text(
+            f"✅ Город выбран: {location_label(city)}.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🌤 Показать погоду", callback_data="weather")
+            ]]),
+        )
         return
     if data.startswith("page:"):
         parts = data.split(":")
@@ -1207,9 +1386,48 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["priority"] = priority
             await ask_due(update, context)
         return
-    if data == "due:none" and context.user_data.get("flow") == "add_due":
-        context.user_data["due_at"] = None
-        await ask_reminder(update, context)
+    if data.startswith("dueday:"):
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] not in {"add", "edit"}:
+            return
+        _, mode, choice = parts
+        if context.user_data.get("flow") != f"{mode}_due_choice":
+            await query.message.reply_text("Выбор срока устарел. Начните его заново.")
+            return
+        if choice == "none":
+            await apply_due(update, context, mode, None)
+        elif choice == "manual":
+            context.user_data["flow"] = f"{mode}_due_manual"
+            await query.message.reply_text(
+                f"✍️ Введите срок ({local_tz(context).key}): ДД.ММ.ГГГГ ЧЧ:ММ."
+            )
+        elif choice in {"today", "tomorrow"}:
+            day = now_utc().astimezone(local_tz(context)).date()
+            if choice == "tomorrow":
+                day += timedelta(days=1)
+            context.user_data["due_day"] = day.isoformat()
+            context.user_data["flow"] = f"{mode}_due_time"
+            await query.message.reply_text(
+                f"🕒 Выберите время на {day:%d.%m.%Y} "
+                "или напишите его как ЧЧ:ММ.",
+                reply_markup=due_time_keyboard(mode, day, local_tz(context)),
+            )
+        return
+    if data.startswith("duetime:"):
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] not in {"add", "edit"}:
+            return
+        _, mode, choice = parts
+        if context.user_data.get("flow") != f"{mode}_due_time":
+            await query.message.reply_text("Выбор времени устарел. Начните его заново.")
+            return
+        if choice == "manual":
+            await query.message.reply_text("✍️ Напишите время как ЧЧ:ММ.")
+        elif len(choice) == 4 and choice.isdigit():
+            await accept_due_time(update, context, mode, f"{choice[:2]}:{choice[2:]}")
+        return
+    if data == "due:none" and context.user_data.get("flow") in {"add_due", "add_due_choice"}:
+        await apply_due(update, context, "add", None)
         return
     if data.startswith("reminder:") and context.user_data.get("flow") == "add_reminder":
         try:
@@ -1220,13 +1438,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if context.user_data["due_at"] is None:
             minutes = 0
+        title = context.user_data["title"]
         task_number = add_task(
             db_path(context), update.effective_user.id, update.effective_chat.id,
-            context.user_data["title"], context.user_data["priority"],
+            title, context.user_data["priority"],
             context.user_data["due_at"], minutes,
         )
         context.user_data.clear()
-        await query.message.reply_text(f"✅ Задача #{task_number} добавлена.")
+        await query.message.reply_text(f"✅ Задача #{task_number} «{title}» добавлена.")
         return
     if data.startswith("field:"):
         parts = data.split(":")
@@ -1244,9 +1463,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["flow"] = "edit_title"
             await query.message.reply_text("Новое название?")
         elif field == "due":
-            context.user_data["flow"] = "edit_due"
+            context.user_data["flow"] = "edit_due_choice"
             await query.message.reply_text(
-                f"Новый срок ({local_tz(context).key}): ДД.ММ.ГГГГ ЧЧ:ММ или «нет»."
+                f"📅 Новый срок ({local_tz(context).key}): выберите день "
+                "или введите ДД.ММ.ГГГГ ЧЧ:ММ.",
+                reply_markup=due_choice_keyboard("edit", local_tz(context)),
             )
         elif field == "priority":
             context.user_data["flow"] = "edit_priority"
