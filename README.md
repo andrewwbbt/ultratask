@@ -86,5 +86,5 @@ python bot.py
 
 ## Отчёты
 
-- [Исходная лабораторная работа по боту для задач](REPORT.md).
-- [Лабораторная работа по интеграции данных](REPORT_DATA_INTEGRATION.md).
+- [Исходная лабораторная работа по боту для задач][(REPORT.md](https://github.com/andrewwbbt/2026-vibecoding-u4225-peshkov_a_k/blob/main/lab1.md).
+- [Лабораторная работа по интеграции данных]([REPORT_DATA_INTEGRATION.md](https://github.com/andrewwbbt/2026-vibecoding-u4225-peshkov_a_k/blob/main/lab2.md).
