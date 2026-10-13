@@ -88,3 +88,4 @@ python bot.py
 
 - [Лабораторная работа 1](https://github.com/andrewwbbt/2026-vibecoding-u4225-peshkov_a_k/blob/main/lab1.md)
 - [Лабораторная работа 2](https://github.com/andrewwbbt/2026-vibecoding-u4225-peshkov_a_k/blob/main/lab2.md)
+- [Лабораторная работа 2](https://github.com/andrewwbbt/2026-vibecoding-u4225-peshkov_a_k/blob/main/lab3/lab3.md)
